@@ -1,0 +1,7 @@
+--------------------------------------------dataset info--------------------------------------------
+dataset: geolife_embedding | data_path: /data3/menghaotian/Traj_sim/PDT-VQ/data/sift1m 
+train size: 3000 | test size: 9386 | query size: 1000 | dimension: 128 | normalize: True
+---------------------------------------------model info---------------------------------------------
+structure: transform: msd | vq: dpq | parameters: 32784
+d_in: 128 | d_hidden: 256 | M: 16 | K: 256 | S: 0 | H: 1 | L: 1000 | step_norm: True | head_norm: True |
+initialize the codebook centers...

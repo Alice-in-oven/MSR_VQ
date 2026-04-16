@@ -1,0 +1,24 @@
+--------------------------------------------dataset info--------------------------------------------
+dataset: geolife_embedding | data_path: data/sift1m 
+train size: 7000 | test size: 2000 | query size: 1000 | dimension: 128 | normalize: True
+---------------------------------------------model info---------------------------------------------
+structure: transform: msd | vq: qinco | parameters: 2133890
+d_in: 128 | d_hidden: 256 | M: 16 | K: 256 | S: 1 | H: 1 | L: 1000 | step_norm: True | head_norm: True |
+initialize the codebook centers...
+-------------------------------------start training epochs=200--------------------------------------
+--------------------------------------------dataset info--------------------------------------------
+dataset: geolife_embedding | data_path: data/sift1m 
+train size: 7000 | test size: 2000 | query size: 1000 | dimension: 128 | normalize: True
+---------------------------------------------model info---------------------------------------------
+structure: transform: msd | vq: qinco | parameters: 2133890
+d_in: 128 | d_hidden: 256 | M: 16 | K: 256 | S: 1 | H: 1 | L: 1000 | step_norm: True | head_norm: True |
+initialize the codebook centers...
+-------------------------------------start training epochs=200--------------------------------------
+--------------------------------------------dataset info--------------------------------------------
+dataset: geolife_embedding | data_path: data/sift1m 
+train size: 7000 | test size: 2000 | query size: 1000 | dimension: 128 | normalize: True
+---------------------------------------------model info---------------------------------------------
+structure: transform: msd | vq: qinco | parameters: 2133890
+d_in: 128 | d_hidden: 256 | M: 16 | K: 256 | S: 1 | H: 1 | L: 1000 | step_norm: True | head_norm: True |
+initialize the codebook centers...
+-------------------------------------start training epochs=200--------------------------------------
