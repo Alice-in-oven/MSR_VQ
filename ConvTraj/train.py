@@ -19,6 +19,27 @@ CONVTRAJ_ROOT = REPO_ROOT / "ConvTraj"
 DATA_ROOT = CONVTRAJ_ROOT / "data"
 
 
+def resolve_default_dataset_root(dataset_name: str, requested_root_path: str) -> str:
+    requested = str(requested_root_path or "").strip()
+    if not requested:
+        requested = str(DATA_ROOT)
+    requested_path = Path(requested).expanduser()
+    dataset_key = str(dataset_name or "").strip().lower()
+    if not dataset_key:
+        return str(requested_path)
+    default_data_root = DATA_ROOT.resolve()
+    try:
+        requested_resolved = requested_path.resolve()
+    except FileNotFoundError:
+        requested_resolved = requested_path
+    if requested_resolved != default_data_root:
+        return str(requested_path)
+    candidate_root = DATA_ROOT / "0_{}".format(dataset_key)
+    if candidate_root.exists():
+        return str(candidate_root)
+    return str(requested_path)
+
+
 def load_custom(traj_data_path: str, train_dist_path: str, test_top100_path: str):
     """
     Custom v2 format:
@@ -89,6 +110,7 @@ def get_args():
     parser.add_argument("--root_read_path",                 type=str,   default=str(DATA_ROOT), help="root read path")
     parser.add_argument("--artifact_prefix",                type=str,   default="", help="standard artifact prefix for checkpoints, metrics, embeddings, and reports")
     parser.add_argument("--dist_type",                      type=str,   default="dtw", help="distance type")
+    parser.add_argument("--grid_size",                      type=float, default=0.0, help="optional override for equal-grid meshing size; <=0 keeps dataset default")
     parser.add_argument("--image_mode",                     type=str,   default="binary", choices=["binary", "motion6", "motion6_pyr2", "multigrid3"], help="2D trajectory image mode")
     parser.add_argument("--embedding_backbone",             type=str,   default="msr", choices=["msr", "neutraj", "simformer"], help="continuous embedding backbone before PDT-VQ")
     parser.add_argument("--backbone_seq_max_length",        type=int,   default=200, help="maximum per-trajectory sequence length fed into non-MSR backbones via uniform downsampling")
@@ -108,10 +130,10 @@ def get_args():
     parser.add_argument("--qinco_identity_init",           action="store_true", help="initialize QINCo refinement blocks close to identity so codebook init is preserved")
     parser.add_argument("--disable_pdt_init_codebook",      action="store_true", help="disable PDT-VQ codebook initialization from trajectory embeddings")
     parser.add_argument("--eval_embedding_type",            type=str,   default="quantized", choices=["quantized", "continuous", "both"], help="which embedding type to evaluate/export")
-    parser.add_argument("--eval_search_mode",              type=str,   default="decoded", choices=["decoded", "adc", "both"], help="search mode for quantized retrieval evaluation")
+    parser.add_argument("--eval_search_mode",              type=str,   default="decoded", choices=["decoded", "adc", "both"], help="search mode for quantized retrieval evaluation; adc means true asymmetric distance computation with query transformed embeddings vs base codes+codebook")
     parser.add_argument("--enable_rerank",                 action="store_true", help="enable reranking on top of coarse retrieval")
     parser.add_argument("--rerank_L",                      type=int,   default=100, help="shortlist size for reranking")
-    parser.add_argument("--rerank_source",                 type=str,   default="decoded", choices=["decoded", "adc"], help="coarse retrieval source for reranking")
+    parser.add_argument("--rerank_source",                 type=str,   default="decoded", choices=["decoded", "adc"], help="coarse retrieval source for reranking; adc uses the true ADC shortlist when eval_search_mode includes adc")
     parser.add_argument("--disable_code_usage_stats",       action="store_true", help="disable quantized code usage statistics")
     parser.add_argument("--load_model_train_flag",         type=str,   default=None, help="load checkpoint from another train_flag when running evaluation-only")
     parser.add_argument("--backbone_checkpoint",            type=str,   default=None, help="optional pretrained MSR backbone checkpoint")
@@ -179,6 +201,18 @@ def get_args():
     parser.add_argument("--decoded_ste_metric_start_epoch", type=int, default=80, help="epoch to start the decoded STE metric loss")
     parser.add_argument("--decoded_ste_metric_warmup_epochs", type=int, default=20, help="warmup epochs for the decoded STE metric loss weight")
     parser.add_argument("--decoded_ste_metric_max_weight", type=float, default=0.03, help="maximum weight for the decoded STE metric loss")
+    parser.add_argument("--porto_opq_warmup_train_recon_path", type=str, default="", help="Porto-only path to offline OPQ reconstructed train embeddings used as an early decoded warm-start target")
+    parser.add_argument("--porto_opq_warmup_start_epoch", type=int, default=0, help="Porto-only epoch to start the OPQ decoded warm-start")
+    parser.add_argument("--porto_opq_warmup_end_epoch", type=int, default=0, help="Porto-only exclusive end epoch for the OPQ decoded warm-start; <= start disables it")
+    parser.add_argument("--porto_opq_warmup_max_weight", type=float, default=0.0, help="Porto-only maximum weight for the OPQ decoded warm-start loss")
+    parser.add_argument("--porto_opq_teacher_rotated_train_path", type=str, default="", help="Porto-only path to offline OPQ rotated train embeddings used for z-space teacher alignment")
+    parser.add_argument("--porto_opq_teacher_codebook_path", type=str, default="", help="Porto-only path to offline OPQ PQ codebook used for teacher partition distillation / optional codebook init")
+    parser.add_argument("--porto_opq_teacher_start_epoch", type=int, default=0, help="Porto-only epoch to start OPQ z/code partition teacher distillation")
+    parser.add_argument("--porto_opq_teacher_end_epoch", type=int, default=0, help="Porto-only exclusive end epoch for OPQ z/code partition teacher distillation; <= start disables it")
+    parser.add_argument("--porto_opq_teacher_z_weight", type=float, default=0.0, help="Porto-only max weight for z-space alignment to offline OPQ rotated embeddings")
+    parser.add_argument("--porto_opq_teacher_partition_weight", type=float, default=0.0, help="Porto-only max weight for offline OPQ partition/code distillation")
+    parser.add_argument("--porto_opq_teacher_codebook_freeze_end_epoch", type=int, default=0, help="Porto-only exclusive end epoch to keep the student PDT codebook frozen to the OPQ teacher")
+    parser.add_argument("--porto_opq_teacher_realign_codebook_on_unfreeze", action="store_true", help="Porto-only: copy the OPQ teacher codebook back into the student once when the frozen codebook stage ends")
     parser.add_argument("--late_finetune_start_epoch",     type=int,   default=-1, help="epoch to rebuild the optimizer with smaller late-stage learning rates")
     parser.add_argument("--late_finetune_main_lr_scale",   type=float, default=1.0, help="late-stage multiplier for the main optimizer group learning rate")
     parser.add_argument("--late_finetune_pre_quant_lr_scale", type=float, default=1.0, help="late-stage multiplier for the bottleneck optimizer group learning rate")
@@ -186,6 +220,10 @@ def get_args():
     parser.add_argument("--query_set_size",                type=int,   default=None, help="optional override for the query split size")
     parser.add_argument("--base_set_size",                 type=int,   default=None, help="optional override for the base split size")
     parser.add_argument("--max_train_batches_per_epoch",   type=int,   default=0, help="limit the number of batches per epoch for smoke/sanity runs")
+    parser.add_argument("--triplet_pos_begin_pos",         type=int,   default=0, help="inclusive lower bound of the positive neighbor sampling window")
+    parser.add_argument("--triplet_pos_end_pos",           type=int,   default=200, help="inclusive upper bound of the positive neighbor sampling window")
+    parser.add_argument("--triplet_neg_begin_pos",         type=int,   default=0, help="inclusive lower bound of the negative neighbor sampling window")
+    parser.add_argument("--triplet_neg_end_pos",           type=int,   default=200, help="inclusive upper bound of the negative neighbor sampling window")
 
     args = parser.parse_args()
     if args.network_type == "TJCNN" and args.image_mode != "binary":
@@ -210,20 +248,14 @@ if __name__ == "__main__":
 
     function.setup_seed(args.random_seed)
 
-    root_read_path = str(args.root_read_path)
+    root_read_path = resolve_default_dataset_root(args.dataset, args.root_read_path)
+    if root_read_path != str(args.root_read_path):
+        print("Resolved dataset root_read_path to {}".format(root_read_path))
     if function.has_split_dataset(root_read_path):
         print("Dataset: {} (split dataset)".format(args.dataset))
         traj_list, train_set, query_set, base_set, train_dist_matrix, test_dist_matrix = function.load_split_dataset(
             root_read_path,
             args.dist_type,
-        )
-    elif args.dataset == "porto" and "0_porto_all" not in root_read_path:
-        print("Dataset: Porto (features_v2)")
-        train_set, query_set, base_set = 4000, 1000, 1000000
-        traj_list, train_range, test_range, base_range, train_dist_matrix, test_dist_matrix = load_custom(
-            str(DATA_ROOT / 'features_v2' / 'traj_data_Porto.pkl'),
-            str(DATA_ROOT / 'features_v2' / 'train_dist_Porto_dtw.f32mmap'),
-            str(DATA_ROOT / 'features_v2' / 'test_top100_Porto_dtw.jsonl'),
         )
     elif args.dataset == "porto" and "0_porto_all" in root_read_path:
         print("Dataset: Porto (legacy 0_porto_all)")
@@ -286,7 +318,13 @@ if __name__ == "__main__":
     #traj_list = np.array(traj_list)
 
     print("Time to meshing...")
-    lon_grid_id_list, lat_grid_id_list, lon_input_size, lat_input_size, lon_list, lat_list = grid.split_traj_into_equal_grid(traj_list)
+    effective_grid_size = float(args.grid_size) if float(args.grid_size) > 0.0 else None
+    if effective_grid_size is not None:
+        print("Using custom grid_size:", effective_grid_size)
+    lon_grid_id_list, lat_grid_id_list, lon_input_size, lat_input_size, lon_list, lat_list = grid.split_traj_into_equal_grid(
+        traj_list,
+        grid_size=effective_grid_size,
+    )
     print("lon_input_size:", lon_input_size, " lat_input_size:", lat_input_size)
     #lon_grid_id_list, lat_grid_id_list, lon_input_size, lat_input_size, lon_list, lat_list =pickle.load(open('/data3/menghaotian/Traj_sim/datasets/features_sampling/grid.pkl', 'rb'))
     #l = [lon_grid_id_list, lat_grid_id_list, lon_input_size, lat_input_size, lon_list, lat_list]
@@ -312,6 +350,7 @@ if __name__ == "__main__":
                             root_write_path                = args.root_write_path,
                             root_read_path                 = args.root_read_path,
                             artifact_prefix                = artifact_prefix,
+                            grid_size                      = args.grid_size,
                             image_mode                     = args.image_mode,
                             embedding_backbone             = args.embedding_backbone,
                             backbone_seq_max_length        = args.backbone_seq_max_length,
@@ -402,14 +441,31 @@ if __name__ == "__main__":
                             decoded_ste_metric_start_epoch  = args.decoded_ste_metric_start_epoch,
                             decoded_ste_metric_warmup_epochs = args.decoded_ste_metric_warmup_epochs,
                             decoded_ste_metric_max_weight   = args.decoded_ste_metric_max_weight,
+                            porto_opq_warmup_train_recon_path = args.porto_opq_warmup_train_recon_path,
+                            porto_opq_warmup_start_epoch   = args.porto_opq_warmup_start_epoch,
+                            porto_opq_warmup_end_epoch     = args.porto_opq_warmup_end_epoch,
+                            porto_opq_warmup_max_weight    = args.porto_opq_warmup_max_weight,
+                            porto_opq_teacher_rotated_train_path = args.porto_opq_teacher_rotated_train_path,
+                            porto_opq_teacher_codebook_path = args.porto_opq_teacher_codebook_path,
+                            porto_opq_teacher_start_epoch  = args.porto_opq_teacher_start_epoch,
+                            porto_opq_teacher_end_epoch    = args.porto_opq_teacher_end_epoch,
+                            porto_opq_teacher_z_weight     = args.porto_opq_teacher_z_weight,
+                            porto_opq_teacher_partition_weight = args.porto_opq_teacher_partition_weight,
+                            porto_opq_teacher_codebook_freeze_end_epoch = args.porto_opq_teacher_codebook_freeze_end_epoch,
+                            porto_opq_teacher_realign_codebook_on_unfreeze = args.porto_opq_teacher_realign_codebook_on_unfreeze,
                             late_finetune_start_epoch      = args.late_finetune_start_epoch,
                             late_finetune_main_lr_scale    = args.late_finetune_main_lr_scale,
                             late_finetune_pre_quant_lr_scale = args.late_finetune_pre_quant_lr_scale,
                             max_train_batches_per_epoch    = args.max_train_batches_per_epoch,
+                            triplet_pos_begin_pos          = args.triplet_pos_begin_pos,
+                            triplet_pos_end_pos            = args.triplet_pos_end_pos,
+                            triplet_neg_begin_pos          = args.triplet_neg_begin_pos,
+                            triplet_neg_end_pos            = args.triplet_neg_end_pos,
                             train_ratio                    = args.train_ratio,
                             mode                           = args.mode,
                             test_epoch                     = args.test_epoch,
                             print_epoch                    = args.print_epoch,
+                            save_model_epoch               = args.save_model_epoch,
                             save_model                     = args.save_model,
                             eval_save_epochs               = args.eval_save_epochs,
                             save_feature_distance          = args.save_feature_distance,

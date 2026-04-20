@@ -40,6 +40,8 @@ class NeuTrajTrainer(object):
         self.pre_quant_neighbor_artifact = None
         self.pre_quant_landmark_artifact = None
         self.pre_quant_landmark_bank = None
+        self.porto_opq_warmup_teacher = None
+        self.porto_opq_partition_teacher = None
 
     def _parse_epoch_list(self, value):
         if value is None:
@@ -63,6 +65,13 @@ class NeuTrajTrainer(object):
             return max_weight
         progress = min(1.0, float(epoch - start_epoch + 1) / float(warmup_epochs))
         return max_weight * progress
+
+    def _linear_decay_weight(self, epoch, start_epoch, end_epoch, max_weight):
+        if epoch < start_epoch or end_epoch <= start_epoch or epoch >= end_epoch:
+            return 0.0
+        span = max(1, int(end_epoch) - int(start_epoch))
+        progress = float(epoch - start_epoch) / float(span)
+        return max_weight * max(0.0, 1.0 - progress)
 
     def _optimizer_phase(self, epoch):
         late_finetune_start_epoch = int(self.my_config.my_dict.get("late_finetune_start_epoch", -1))
@@ -134,6 +143,36 @@ class NeuTrajTrainer(object):
         stage_name = "pdt_only" if freeze_backbone else "joint"
         print("[TrainStage] {} | trainable params: {}".format(stage_name, len(trainable_names)))
         return stage_name
+
+    def _copy_porto_teacher_codebook(self, my_net, reason=""):
+        teacher_bundle = getattr(self, "porto_opq_partition_teacher", None)
+        if not teacher_bundle:
+            return False
+        quantizer = getattr(getattr(my_net.PDT_model, "vq", None), "quantizer", None)
+        teacher_codebook = teacher_bundle.get("codebook")
+        if quantizer is None or not hasattr(quantizer, "codebook") or teacher_codebook is None:
+            return False
+        teacher_codebook = torch.from_numpy(np.asarray(teacher_codebook, dtype=np.float32)).to(self.my_config.my_dict["device"])
+        if tuple(teacher_codebook.shape) != tuple(quantizer.codebook.shape):
+            print("[OPQTeacher] skip codebook copy: teacher shape {} != student shape {}".format(
+                tuple(teacher_codebook.shape),
+                tuple(quantizer.codebook.shape),
+            ))
+            return False
+        with torch.no_grad():
+            quantizer.codebook.copy_(teacher_codebook)
+        print("[OPQTeacher] codebook copied from teacher{}".format(
+            "" if not reason else " ({})".format(reason)
+        ))
+        return True
+
+    def _set_porto_teacher_codebook_trainable(self, my_net, freeze_codebook):
+        quantizer = getattr(getattr(my_net.PDT_model, "vq", None), "quantizer", None)
+        if quantizer is None or not hasattr(quantizer, "codebook"):
+            return False
+        quantizer.codebook.requires_grad = not freeze_codebook
+        print("[OPQTeacher] codebook {}.".format("frozen" if freeze_codebook else "unfrozen"))
+        return True
 
     def _collect_embedding_outputs(self,
                                    my_net,
@@ -430,6 +469,22 @@ class NeuTrajTrainer(object):
         if not self.my_config.my_dict.get("pdt_init_codebook", True):
             print("[PDT] Skipping codebook initialization.")
             return
+        teacher_bundle = self.porto_opq_partition_teacher
+        if teacher_bundle is not None:
+            teacher_codebook = teacher_bundle.get("codebook")
+            quantizer = getattr(getattr(my_net.PDT_model, "vq", None), "quantizer", None)
+            if teacher_codebook is not None and quantizer is not None and hasattr(quantizer, "codebook"):
+                teacher_codebook = torch.from_numpy(np.asarray(teacher_codebook, dtype=np.float32)).to(self.my_config.my_dict["device"])
+                if tuple(teacher_codebook.shape) == tuple(quantizer.codebook.shape):
+                    with torch.no_grad():
+                        quantizer.codebook.copy_(teacher_codebook)
+                    self._reset_pdt_quantizer_temperatures(my_net)
+                    print("[PDT] Initialized codebook from Porto OPQ teacher with shape {}.".format(tuple(teacher_codebook.shape)))
+                    return
+                print("[PDT] Porto OPQ teacher codebook shape {} does not match student codebook {}; fallback to default init.".format(
+                    tuple(teacher_codebook.shape),
+                    tuple(quantizer.codebook.shape),
+                ))
         print("[PDT] Initializing codebook from current train embeddings...")
         init_batch_size = min(16, int(self.my_config.my_dict.get("batch_size", 256)))
         init_limit = self.final_traj_train_num if init_limit is None else min(int(init_limit), self.final_traj_train_num)
@@ -590,6 +645,32 @@ class NeuTrajTrainer(object):
         decoded_ste_metric_start_epoch = int(self.my_config.my_dict.get("decoded_ste_metric_start_epoch", 80))
         decoded_ste_metric_warmup_epochs = int(self.my_config.my_dict.get("decoded_ste_metric_warmup_epochs", 20))
         decoded_ste_metric_max_weight = float(self.my_config.my_dict.get("decoded_ste_metric_max_weight", 0.03))
+        dataset_name = str(self.my_config.my_dict.get("dataset", "") or "").strip().lower()
+        porto_opq_warmup_train_recon_path = str(self.my_config.my_dict.get("porto_opq_warmup_train_recon_path", "") or "").strip()
+        porto_opq_warmup_start_epoch = int(self.my_config.my_dict.get("porto_opq_warmup_start_epoch", 0))
+        porto_opq_warmup_end_epoch = int(self.my_config.my_dict.get("porto_opq_warmup_end_epoch", 0))
+        porto_opq_warmup_max_weight = float(self.my_config.my_dict.get("porto_opq_warmup_max_weight", 0.0))
+        # This teacher path stays fully opt-in: nothing changes for existing datasets
+        # unless explicit artifact paths and positive weights are supplied.
+        porto_opq_warmup_enabled = (
+            porto_opq_warmup_train_recon_path != "" and
+            porto_opq_warmup_end_epoch > porto_opq_warmup_start_epoch and
+            porto_opq_warmup_max_weight > 0.0
+        )
+        porto_opq_teacher_rotated_train_path = str(self.my_config.my_dict.get("porto_opq_teacher_rotated_train_path", "") or "").strip()
+        porto_opq_teacher_codebook_path = str(self.my_config.my_dict.get("porto_opq_teacher_codebook_path", "") or "").strip()
+        porto_opq_teacher_start_epoch = int(self.my_config.my_dict.get("porto_opq_teacher_start_epoch", 0))
+        porto_opq_teacher_end_epoch = int(self.my_config.my_dict.get("porto_opq_teacher_end_epoch", 0))
+        porto_opq_teacher_z_weight = float(self.my_config.my_dict.get("porto_opq_teacher_z_weight", 0.0))
+        porto_opq_teacher_partition_weight = float(self.my_config.my_dict.get("porto_opq_teacher_partition_weight", 0.0))
+        porto_opq_teacher_codebook_freeze_end_epoch = int(self.my_config.my_dict.get("porto_opq_teacher_codebook_freeze_end_epoch", 0))
+        porto_opq_teacher_realign_codebook_on_unfreeze = bool(self.my_config.my_dict.get("porto_opq_teacher_realign_codebook_on_unfreeze", False))
+        porto_opq_teacher_enabled = (
+            porto_opq_teacher_rotated_train_path != "" and
+            porto_opq_teacher_codebook_path != "" and
+            porto_opq_teacher_end_epoch > porto_opq_teacher_start_epoch and
+            (porto_opq_teacher_z_weight > 0.0 or porto_opq_teacher_partition_weight > 0.0)
+        )
         effective_refresh_end_epoch = int(self.my_config.my_dict["epoch_num"])
         if pre_quant_refresh_end_epoch > 0:
             effective_refresh_end_epoch = min(pre_quant_refresh_end_epoch, effective_refresh_end_epoch)
@@ -672,6 +753,20 @@ class NeuTrajTrainer(object):
             "decoded_ste_metric_start_epoch": decoded_ste_metric_start_epoch,
             "decoded_ste_metric_warmup_epochs": decoded_ste_metric_warmup_epochs,
             "decoded_ste_metric_max_weight": decoded_ste_metric_max_weight,
+            "porto_opq_warmup_enabled": porto_opq_warmup_enabled,
+            "porto_opq_warmup_train_recon_path": porto_opq_warmup_train_recon_path,
+            "porto_opq_warmup_start_epoch": porto_opq_warmup_start_epoch,
+            "porto_opq_warmup_end_epoch": porto_opq_warmup_end_epoch,
+            "porto_opq_warmup_max_weight": porto_opq_warmup_max_weight,
+            "porto_opq_teacher_enabled": porto_opq_teacher_enabled,
+            "porto_opq_teacher_rotated_train_path": porto_opq_teacher_rotated_train_path,
+            "porto_opq_teacher_codebook_path": porto_opq_teacher_codebook_path,
+            "porto_opq_teacher_start_epoch": porto_opq_teacher_start_epoch,
+            "porto_opq_teacher_end_epoch": porto_opq_teacher_end_epoch,
+            "porto_opq_teacher_z_weight": porto_opq_teacher_z_weight,
+            "porto_opq_teacher_partition_weight": porto_opq_teacher_partition_weight,
+            "porto_opq_teacher_codebook_freeze_end_epoch": porto_opq_teacher_codebook_freeze_end_epoch,
+            "porto_opq_teacher_realign_codebook_on_unfreeze": porto_opq_teacher_realign_codebook_on_unfreeze,
             "late_finetune_enabled": late_finetune_enabled,
             "late_finetune_start_epoch": late_finetune_start_epoch,
             "late_finetune_main_lr_scale": late_finetune_main_lr_scale,
@@ -1003,6 +1098,12 @@ class NeuTrajTrainer(object):
             "avg_student_profile_distance": 0.0,
             "avg_profile_cosine": 0.0,
         }
+        porto_opq_warmup_loss = None
+        porto_opq_warmup_weight = 0.0
+        porto_opq_teacher_z_loss = None
+        porto_opq_teacher_partition_loss = None
+        porto_opq_teacher_z_weight = 0.0
+        porto_opq_teacher_partition_weight = 0.0
         combined_e_cont = torch.cat((anchor_outputs["e_cont"], positive_outputs["e_cont"], negative_outputs["e_cont"]), dim=0)
         combined_e_for_pdt = torch.cat((anchor_outputs["e_for_pdt"], positive_outputs["e_for_pdt"], negative_outputs["e_for_pdt"]), dim=0)
         combined_e_hat = torch.cat((anchor_outputs["e_hat"], positive_outputs["e_hat"], negative_outputs["e_hat"]), dim=0)
@@ -1013,6 +1114,55 @@ class NeuTrajTrainer(object):
                 np.asarray(sample_index_array[1], dtype=np.int64),
                 np.asarray(sample_index_array[2], dtype=np.int64),
             ], axis=0)
+        if training_state.get("porto_opq_warmup_enabled", False):
+            porto_opq_warmup_weight = self._linear_decay_weight(
+                epoch,
+                training_state.get("porto_opq_warmup_start_epoch", 0),
+                training_state.get("porto_opq_warmup_end_epoch", 0),
+                training_state.get("porto_opq_warmup_max_weight", 0.0),
+            )
+            if porto_opq_warmup_weight > 0.0:
+                if combined_sample_indices is None:
+                    raise ValueError("Porto OPQ warmup requires sample indices in the training batch.")
+                if self.porto_opq_warmup_teacher is None:
+                    raise ValueError("Porto OPQ warmup teacher is not loaded.")
+                teacher_recon = torch.from_numpy(self.porto_opq_warmup_teacher[combined_sample_indices]).to(combined_e_hat.device)
+                porto_opq_warmup_loss = torch.nn.functional.smooth_l1_loss(combined_e_hat, teacher_recon)
+                loss = loss + porto_opq_warmup_weight * porto_opq_warmup_loss
+        if training_state.get("porto_opq_teacher_enabled", False):
+            if combined_sample_indices is None:
+                raise ValueError("Porto OPQ partition teacher requires sample indices in the training batch.")
+            if self.porto_opq_partition_teacher is None:
+                raise ValueError("Porto OPQ partition teacher is not loaded.")
+            porto_opq_teacher_z_weight = self._linear_decay_weight(
+                epoch,
+                training_state.get("porto_opq_teacher_start_epoch", 0),
+                training_state.get("porto_opq_teacher_end_epoch", 0),
+                training_state.get("porto_opq_teacher_z_weight", 0.0),
+            )
+            porto_opq_teacher_partition_weight = self._linear_decay_weight(
+                epoch,
+                training_state.get("porto_opq_teacher_start_epoch", 0),
+                training_state.get("porto_opq_teacher_end_epoch", 0),
+                training_state.get("porto_opq_teacher_partition_weight", 0.0),
+            )
+            if porto_opq_teacher_z_weight > 0.0 or porto_opq_teacher_partition_weight > 0.0:
+                student_z = my_net.PDT_model._encode_last(combined_e_for_pdt, out_step=my_net.pdt_args.steps)
+                if porto_opq_teacher_z_weight > 0.0:
+                    teacher_rot = torch.from_numpy(self.porto_opq_partition_teacher["rotated"][combined_sample_indices]).to(student_z.device)
+                    porto_opq_teacher_z_loss = torch.nn.functional.smooth_l1_loss(student_z, teacher_rot)
+                    loss = loss + porto_opq_teacher_z_weight * porto_opq_teacher_z_loss
+                if porto_opq_teacher_partition_weight > 0.0:
+                    quantizer = getattr(getattr(my_net.PDT_model, "vq", None), "quantizer", None)
+                    if quantizer is None or not hasattr(quantizer, "compute_score"):
+                        raise ValueError("Porto OPQ partition teacher requires a quantizer with compute_score().")
+                    student_score = quantizer.compute_score(student_z)
+                    teacher_codes = torch.from_numpy(self.porto_opq_partition_teacher["codes"][combined_sample_indices]).to(student_score.device)
+                    porto_opq_teacher_partition_loss = torch.nn.functional.cross_entropy(
+                        student_score.reshape(-1, student_score.shape[-1]),
+                        teacher_codes.reshape(-1),
+                    )
+                    loss = loss + porto_opq_teacher_partition_weight * porto_opq_teacher_partition_loss
         e_cont_norm = torch.norm(combined_e_cont, dim=1).mean()
         e_bottleneck_norm = torch.norm(combined_e_for_pdt, dim=1).mean()
         e_hat_norm = torch.norm(combined_e_hat, dim=1).mean()
@@ -1157,6 +1307,12 @@ class NeuTrajTrainer(object):
             "pairwise_consistency_loss": pairwise_consistency_loss,
             "decoded_ste_metric_loss": decoded_ste_metric_loss,
             "decoded_ste_metric_weight": decoded_ste_metric_weight,
+            "porto_opq_warmup_loss": porto_opq_warmup_loss,
+            "porto_opq_warmup_weight": porto_opq_warmup_weight,
+            "porto_opq_teacher_z_loss": porto_opq_teacher_z_loss,
+            "porto_opq_teacher_partition_loss": porto_opq_teacher_partition_loss,
+            "porto_opq_teacher_z_weight": porto_opq_teacher_z_weight,
+            "porto_opq_teacher_partition_weight": porto_opq_teacher_partition_weight,
             "decoded_ste_hard_soft_gap": decoded_ste_hard_soft_gap,
             "entropy_reg_loss": entropy_reg_loss,
             "commitment_reg_loss": commitment_reg_loss,
@@ -1659,6 +1815,102 @@ class NeuTrajTrainer(object):
             ))
         return training_state
 
+    def _prepare_porto_opq_warmup(self, training_state):
+        self.porto_opq_warmup_teacher = None
+        if not training_state.get("porto_opq_warmup_enabled", False):
+            return training_state
+
+        artifact_path = Path(training_state["porto_opq_warmup_train_recon_path"])
+        if not artifact_path.exists():
+            raise ValueError("OPQ warmup artifact does not exist: {}".format(artifact_path))
+
+        with open(artifact_path, "rb") as f:
+            teacher = pickle.load(f)
+        teacher = np.asarray(teacher, dtype=np.float32)
+        if teacher.ndim != 2:
+            raise ValueError("Porto OPQ warmup artifact must be 2D, got {}".format(teacher.shape))
+        expected_rows = int(self.final_traj_train_num)
+        if teacher.shape[0] < expected_rows:
+            raise ValueError(
+                "Porto OPQ warmup row mismatch: teacher_rows={} expected_train_rows={}".format(
+                    teacher.shape[0],
+                    expected_rows,
+                )
+            )
+        if teacher.shape[0] > expected_rows:
+            teacher = teacher[:expected_rows].copy()
+
+        self.porto_opq_warmup_teacher = teacher
+        print("[OPQWarmup] enabled | path={} | shape={} | epochs=[{}, {}) | max_weight={:.4f}".format(
+            artifact_path,
+            tuple(teacher.shape),
+            int(training_state["porto_opq_warmup_start_epoch"]),
+            int(training_state["porto_opq_warmup_end_epoch"]),
+            float(training_state["porto_opq_warmup_max_weight"]),
+        ))
+        return training_state
+
+    def _prepare_porto_opq_partition_teacher(self, training_state):
+        self.porto_opq_partition_teacher = None
+        if not training_state.get("porto_opq_teacher_enabled", False):
+            return training_state
+
+        rotated_path = Path(training_state["porto_opq_teacher_rotated_train_path"])
+        codebook_path = Path(training_state["porto_opq_teacher_codebook_path"])
+        if not rotated_path.exists():
+            raise ValueError("OPQ teacher rotated artifact does not exist: {}".format(rotated_path))
+        if not codebook_path.exists():
+            raise ValueError("OPQ teacher codebook artifact does not exist: {}".format(codebook_path))
+
+        with open(rotated_path, "rb") as f:
+            rotated = pickle.load(f)
+        rotated = np.asarray(rotated, dtype=np.float32)
+        codebook = np.load(codebook_path).astype(np.float32, copy=False)
+        if rotated.ndim != 2:
+            raise ValueError("Porto OPQ rotated artifact must be 2D, got {}".format(rotated.shape))
+        if codebook.ndim != 3:
+            raise ValueError("Porto OPQ codebook must be 3D, got {}".format(codebook.shape))
+        expected_rows = int(self.final_traj_train_num)
+        if rotated.shape[0] < expected_rows:
+            raise ValueError(
+                "OPQ teacher rotated row mismatch: teacher_rows={} expected_train_rows={}".format(
+                    rotated.shape[0],
+                    expected_rows,
+                )
+            )
+        if rotated.shape[0] > expected_rows:
+            rotated = rotated[:expected_rows].copy()
+        if rotated.shape[1] != int(codebook.shape[0] * codebook.shape[2]):
+            raise ValueError(
+                "OPQ teacher rotated dim {} does not match codebook product {}x{}.".format(
+                    rotated.shape[1],
+                    codebook.shape[0],
+                    codebook.shape[2],
+                )
+            )
+
+        rotated_groups = rotated.reshape(rotated.shape[0], codebook.shape[0], codebook.shape[2])
+        diff = rotated_groups[:, :, None, :] - codebook[None, :, :, :]
+        sq_dist = np.sum(diff * diff, axis=-1)
+        teacher_codes = np.argmin(sq_dist, axis=-1).astype(np.int64, copy=False)
+
+        self.porto_opq_partition_teacher = {
+            "rotated": rotated,
+            "codebook": codebook,
+            "codes": teacher_codes,
+        }
+        print("[OPQTeacher] enabled | rotated={} | codebook={} | epochs=[{}, {}) | z_weight={:.4f} | part_weight={:.4f} | freeze_codebook_until={} | realign_on_unfreeze={}".format(
+            tuple(rotated.shape),
+            tuple(codebook.shape),
+            int(training_state["porto_opq_teacher_start_epoch"]),
+            int(training_state["porto_opq_teacher_end_epoch"]),
+            float(training_state["porto_opq_teacher_z_weight"]),
+            float(training_state["porto_opq_teacher_partition_weight"]),
+            int(training_state.get("porto_opq_teacher_codebook_freeze_end_epoch", 0)),
+            bool(training_state.get("porto_opq_teacher_realign_codebook_on_unfreeze", False)),
+        ))
+        return training_state
+
     def build_gt_landmark_profile(self, num_landmarks=None, force_rebuild=False):
         artifact_path = self._build_gt_landmark_artifact(num_landmarks=num_landmarks, force_rebuild=force_rebuild)
         artifact = self._load_pre_quant_landmark_artifact(artifact_path)
@@ -2069,7 +2321,20 @@ class NeuTrajTrainer(object):
                     break
                 anchor_pos = new_list[(i + j)]
                 
-                positive_sampling_index_list, negative_sampling_index_list = sampling_methods.main_triplet_selection(sampling_type, sampling_num, test_knn[anchor_pos], train_distance_matrix[anchor_pos], anchor_pos, final_train_length_list[anchor_pos], final_train_length_list, epoch)
+                positive_sampling_index_list, negative_sampling_index_list = sampling_methods.main_triplet_selection(
+                    sampling_type,
+                    sampling_num,
+                    test_knn[anchor_pos],
+                    train_distance_matrix[anchor_pos],
+                    anchor_pos,
+                    final_train_length_list[anchor_pos],
+                    final_train_length_list,
+                    epoch,
+                    pos_begin_pos=int(self.my_config.my_dict.get("triplet_pos_begin_pos", 0)),
+                    pos_end_pos=int(self.my_config.my_dict.get("triplet_pos_end_pos", 200)),
+                    neg_begin_pos=int(self.my_config.my_dict.get("triplet_neg_begin_pos", 0)),
+                    neg_end_pos=int(self.my_config.my_dict.get("triplet_neg_end_pos", 200)),
+                )
 
                 # cross distance
                 for k in range(len(positive_sampling_index_list)):
@@ -2144,10 +2409,12 @@ class NeuTrajTrainer(object):
             print("[Checkpoint] Loaded MSR backbone from:", backbone_checkpoint)
             print("[Checkpoint] loaded keys:", load_stats["loaded_key_count"], "| skipped keys:", load_stats["skipped_key_count"])
 
-        self._initialize_pdt_codebook(my_net)
         training_state = self._build_training_state()
         training_state = self._prepare_pre_quant_neighbor_teacher(training_state)
         training_state = self._prepare_pre_quant_landmark_teacher(training_state)
+        training_state = self._prepare_porto_opq_warmup(training_state)
+        training_state = self._prepare_porto_opq_partition_teacher(training_state)
+        self._initialize_pdt_codebook(my_net)
         if training_state["loss_recipe"] == "improved_vq" and not training_state["improved_vq_adaptive_low_codebook"]:
             print("[ImprovedVQ] explicit schedule mode | pdt_m: {} | pdt_start: {} | pdt_weight: {:.3f} | qm_start: {} | qm_max: {:.4f} | pairwise: {:.4f} | entropy: {:.4f} | commit: {:.4f} | uniform: {:.6f}".format(
                 training_state["pdt_m"],
@@ -2243,6 +2510,7 @@ class NeuTrajTrainer(object):
             ))
         current_freeze_state = None
         current_optimizer_phase = None
+        current_codebook_freeze_state = None
         optimizer = None
         milestone_epochs = self._parse_epoch_list(self.my_config.my_dict.get("eval_save_epochs", ""))
         if milestone_epochs:
@@ -2265,17 +2533,48 @@ class NeuTrajTrainer(object):
 
             freeze_backbone = epoch < training_state["freeze_backbone_epochs"]
             optimizer_phase = self._optimizer_phase(epoch)
-            if current_freeze_state is None or current_freeze_state != freeze_backbone:
+            freeze_teacher_codebook = False
+            if training_state.get("porto_opq_teacher_enabled", False):
+                freeze_teacher_codebook = epoch < int(training_state.get("porto_opq_teacher_codebook_freeze_end_epoch", 0))
+
+            stage_changed = (current_freeze_state is None or current_freeze_state != freeze_backbone)
+            phase_changed = (current_optimizer_phase != optimizer_phase)
+            codebook_changed = (current_codebook_freeze_state is None or current_codebook_freeze_state != freeze_teacher_codebook)
+
+            if stage_changed:
                 current_freeze_state = freeze_backbone
-                current_optimizer_phase = optimizer_phase
                 stage_name = self._set_backbone_trainable(my_net, freeze_backbone)
-                optimizer = self._build_optimizer(my_net, epoch=epoch, rebuild_reason="stage_change")
-                trainable_num = sum(p.numel() for p in my_net.parameters() if p.requires_grad)
-                print("[TrainStage] epoch {} -> {} | trainable parameters: {}".format(epoch, stage_name, trainable_num))
-            elif current_optimizer_phase != optimizer_phase:
+            else:
+                stage_name = "pdt_only" if freeze_backbone else "joint"
+
+            if stage_changed or codebook_changed:
+                self._set_porto_teacher_codebook_trainable(my_net, freeze_teacher_codebook)
+                if (
+                    codebook_changed and
+                    current_codebook_freeze_state is True and
+                    freeze_teacher_codebook is False and
+                    training_state.get("porto_opq_teacher_realign_codebook_on_unfreeze", False)
+                ):
+                    self._copy_porto_teacher_codebook(my_net, reason="unfreeze_epoch_{}".format(epoch))
+                current_codebook_freeze_state = freeze_teacher_codebook
+
+            if stage_changed or phase_changed or codebook_changed:
                 current_optimizer_phase = optimizer_phase
-                optimizer = self._build_optimizer(my_net, epoch=epoch, rebuild_reason=optimizer_phase)
-                print("[TrainStage] epoch {} -> optimizer rebuilt for {} phase".format(epoch, optimizer_phase))
+                rebuild_reason = []
+                if stage_changed:
+                    rebuild_reason.append("stage_change")
+                if phase_changed:
+                    rebuild_reason.append(optimizer_phase)
+                if codebook_changed:
+                    rebuild_reason.append("codebook_freeze" if freeze_teacher_codebook else "codebook_unfreeze")
+                optimizer = self._build_optimizer(my_net, epoch=epoch, rebuild_reason="+".join(rebuild_reason))
+                trainable_num = sum(p.numel() for p in my_net.parameters() if p.requires_grad)
+                print("[TrainStage] epoch {} -> {} | codebook_frozen={} | trainable parameters: {}".format(
+                    epoch,
+                    stage_name,
+                    freeze_teacher_codebook,
+                    trainable_num,
+                ))
 
             if epoch in training_state["all_refresh_epochs"]:
                 self._refresh_pdt_codebook(my_net, epoch)
@@ -2329,6 +2628,12 @@ class NeuTrajTrainer(object):
                 "pairwise_consistency_loss": self._scalar(last_stats["pairwise_consistency_loss"]),
                 "decoded_ste_metric_loss": self._scalar(last_stats["decoded_ste_metric_loss"]),
                 "decoded_ste_metric_weight": self._scalar(last_stats["decoded_ste_metric_weight"]),
+                "porto_opq_warmup_loss": self._scalar(last_stats["porto_opq_warmup_loss"]),
+                "porto_opq_warmup_weight": self._scalar(last_stats["porto_opq_warmup_weight"]),
+                "porto_opq_teacher_z_loss": self._scalar(last_stats["porto_opq_teacher_z_loss"]),
+                "porto_opq_teacher_partition_loss": self._scalar(last_stats["porto_opq_teacher_partition_loss"]),
+                "porto_opq_teacher_z_weight": self._scalar(last_stats["porto_opq_teacher_z_weight"]),
+                "porto_opq_teacher_partition_weight": self._scalar(last_stats["porto_opq_teacher_partition_weight"]),
                 "decoded_ste_hard_soft_gap": self._scalar(last_stats["decoded_ste_hard_soft_gap"]),
                 "entropy_reg_loss": self._scalar(last_stats["entropy_reg_loss"]),
                 "commitment_reg_loss": self._scalar(last_stats["commitment_reg_loss"]),
@@ -2368,7 +2673,7 @@ class NeuTrajTrainer(object):
 
             if (epoch + 1) % self.my_config.my_dict["print_epoch"] == 0:
                 stage_name = "pdt_only" if epoch < training_state["freeze_backbone_epochs"] else "joint"
-                print('Print Epoch: [{:3d}/{:3d}] Stage: {}, Recipe: {}, Rank Loss: {:.4f}, Mse Loss: {:.4f}, PDT Loss: {:.4f}, Consistency Loss: {:.4f}, Quantized Metric Loss: {:.4f}, Quantized Weight: {:.4f}, Raw Metric Loss: {:.4f}, Raw Metric Weight: {:.4f}, Pairwise Loss: {:.4f}, SteDec Loss: {:.4f}, SteDec Weight: {:.4f}, SteGap: {:.4f}, Entropy Loss: {:.4f}, Commit Loss: {:.4f}, Uniform Loss: {:.4f}, PreQuant Decor: {:.4f}, PreQuant Stab: {:.4f}, PreQuant Total: {:.4f}, PreQuant LambdaD: {:.4f}, PreQuant LambdaS: {:.4f}, NbrBtn: {:.4f}, NbrDec: {:.4f}, TopK: {}, TauBtn: {:.4f}, TauDec: {:.4f}, LmBtn: {:.4f}, LmDec: {:.4f}, LmScale: {:.4f}, LmBank: {}, LmNum: {}, EContNorm: {:.4f}, EBtnNorm: {:.4f}, EHatNorm: {:.4f}, Total Loss: {:.4f}, Time: {:.4f}'.format(
+                print('Print Epoch: [{:3d}/{:3d}] Stage: {}, Recipe: {}, Rank Loss: {:.4f}, Mse Loss: {:.4f}, PDT Loss: {:.4f}, Consistency Loss: {:.4f}, Quantized Metric Loss: {:.4f}, Quantized Weight: {:.4f}, Raw Metric Loss: {:.4f}, Raw Metric Weight: {:.4f}, Pairwise Loss: {:.4f}, SteDec Loss: {:.4f}, SteDec Weight: {:.4f}, PortoOPQ: {:.4f}, PortoOPQW: {:.4f}, PortoOPQZ: {:.4f}, PortoOPQZW: {:.4f}, PortoOPQPart: {:.4f}, PortoOPQPartW: {:.4f}, SteGap: {:.4f}, Entropy Loss: {:.4f}, Commit Loss: {:.4f}, Uniform Loss: {:.4f}, PreQuant Decor: {:.4f}, PreQuant Stab: {:.4f}, PreQuant Total: {:.4f}, PreQuant LambdaD: {:.4f}, PreQuant LambdaS: {:.4f}, NbrBtn: {:.4f}, NbrDec: {:.4f}, TopK: {}, TauBtn: {:.4f}, TauDec: {:.4f}, LmBtn: {:.4f}, LmDec: {:.4f}, LmScale: {:.4f}, LmBank: {}, LmNum: {}, EContNorm: {:.4f}, EBtnNorm: {:.4f}, EHatNorm: {:.4f}, Total Loss: {:.4f}, Time: {:.4f}'.format(
                     epoch,
                     self.my_config.my_dict["epoch_num"],
                     stage_name,
@@ -2384,6 +2689,12 @@ class NeuTrajTrainer(object):
                     self._scalar(last_stats["pairwise_consistency_loss"]),
                     self._scalar(last_stats["decoded_ste_metric_loss"]),
                     self._scalar(last_stats["decoded_ste_metric_weight"]),
+                    self._scalar(last_stats["porto_opq_warmup_loss"]),
+                    self._scalar(last_stats["porto_opq_warmup_weight"]),
+                    self._scalar(last_stats["porto_opq_teacher_z_loss"]),
+                    self._scalar(last_stats["porto_opq_teacher_z_weight"]),
+                    self._scalar(last_stats["porto_opq_teacher_partition_loss"]),
+                    self._scalar(last_stats["porto_opq_teacher_partition_weight"]),
                     self._scalar(last_stats["decoded_ste_hard_soft_gap"]),
                     self._scalar(last_stats["entropy_reg_loss"]),
                     self._scalar(last_stats["commitment_reg_loss"]),
@@ -2412,6 +2723,13 @@ class NeuTrajTrainer(object):
                 
 
             current_epoch = epoch + 1
+            save_model = bool(self.my_config.my_dict.get("save_model", True))
+            save_model_epoch = int(self.my_config.my_dict.get("save_model_epoch", 0))
+            periodic_save_due = (
+                save_model
+                and save_model_epoch > 0
+                and (current_epoch % save_model_epoch == 0)
+            )
             test_due = (current_epoch % self.my_config.my_dict["test_epoch"] == 0)
             milestone_due = current_epoch in milestone_epochs
             should_eval = test_due or milestone_due or current_epoch == self.my_config.my_dict["epoch_num"]
@@ -2439,6 +2757,11 @@ class NeuTrajTrainer(object):
                     print("[RESULT] metrics_path=not_saved(report_only_eval)")
                 else:
                     print("[RESULT] metrics_path={}".format(metrics_path))
+                print("[RESULT] ckpt_path={}".format(save_model_name))
+            elif periodic_save_due:
+                save_model_name = self._save_checkpoint(my_net, current_epoch)
+                print("[RESULT] eval_epoch=skipped")
+                print("[RESULT] metrics_path=not_requested")
                 print("[RESULT] ckpt_path={}".format(save_model_name))
 
         self._save_training_artifacts(train_curve, best_records)
@@ -2482,9 +2805,13 @@ class NeuTrajTrainer(object):
         else:
             collect_embedding_type = "quantized"
 
+        if eval_search_mode in ["adc", "both"]:
+            need_transformed = True
+
         if enable_rerank:
             need_transformed = True
-            need_reconstructed = True
+            if rerank_source == "decoded":
+                need_reconstructed = True
 
         eval_chunk_size = 10240
         eval_batch_size = 1024
@@ -2603,16 +2930,17 @@ class NeuTrajTrainer(object):
 
         adc_pred_knn = None
         if eval_search_mode in ["adc", "both"]:
-            if isinstance(total_continuous_embeddings, np.ndarray) and isinstance(total_quantized_embeddings, np.ndarray):
-                adc_query, _ = self._split_eval_array(total_continuous_embeddings)
-                _, adc_base = self._split_eval_array(total_quantized_embeddings)
-                adc_distance = test_methods.get_feature_distance(adc_query, adc_base)
-                adc_pred_knn = np.argsort(adc_distance, axis=1)[:, :max(100, rerank_L)]
+            if isinstance(total_transformed_embeddings, np.ndarray) and isinstance(total_codes, np.ndarray):
+                adc_codebook = my_net.PDT_model.vq.quantizer.codebook.detach().cpu().numpy()
+                adc_pred_knn = self._compute_adc_pred_knn(adc_codebook,
+                                                          total_transformed_embeddings,
+                                                          total_codes,
+                                                          topk=max(100, rerank_L))
                 metrics_payload["adc"] = test_methods.metrics_from_pred_knn(self.test_knn, adc_pred_knn)
             else:
                 metrics_payload["adc"] = {
                     "available": False,
-                    "reason": "ADC-style asymmetric evaluation requires both continuous query and quantized base embeddings."
+                    "reason": "True ADC evaluation requires transformed embeddings, discrete codes, and the PDT codebook."
                 }
 
         if enable_rerank:

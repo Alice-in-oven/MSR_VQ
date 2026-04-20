@@ -1,11 +1,30 @@
 import random
 
 
-def main_triplet_selection(sampling_type, sampling_num, knn, distance_list, anchor_pos, anchor_length, length_list, epoch):
+def main_triplet_selection(sampling_type,
+                           sampling_num,
+                           knn,
+                           distance_list,
+                           anchor_pos,
+                           anchor_length,
+                           length_list,
+                           epoch,
+                           pos_begin_pos=0,
+                           pos_end_pos=200,
+                           neg_begin_pos=0,
+                           neg_end_pos=200):
     if sampling_type == "distance_sampling1":
         positive_sampling_index_list, negative_sampling_index_list = [], []
 
-        tem_positive_sampling_index_list, tem_negative_sampling_index_list = distance_sampling1(knn, sampling_num, distance_list, pos_begin_pos=0, pos_end_pos=200, neg_begin_pos=0, neg_end_pos=200)
+        tem_positive_sampling_index_list, tem_negative_sampling_index_list = distance_sampling1(
+            knn,
+            sampling_num,
+            distance_list,
+            pos_begin_pos=pos_begin_pos,
+            pos_end_pos=pos_end_pos,
+            neg_begin_pos=neg_begin_pos,
+            neg_end_pos=neg_end_pos,
+        )
         positive_sampling_index_list.extend(tem_positive_sampling_index_list)
         negative_sampling_index_list.extend(tem_negative_sampling_index_list)
 

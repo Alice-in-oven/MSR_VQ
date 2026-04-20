@@ -5,14 +5,18 @@ import matplotlib.pyplot as plt
 GRID_SIZE = 0.002
 
 
-def _equal_grid(one_dim_list):
+def _equal_grid(one_dim_list, grid_size=None):
     min_value_list = [np.min(value) for value in one_dim_list]
     max_value_list = [np.max(value) for value in one_dim_list]
     
     min_value = np.min(min_value_list)
     max_value = np.max(max_value_list)
     
-    grid_size = GRID_SIZE
+    if grid_size is None:
+        grid_size = GRID_SIZE
+    grid_size = float(grid_size)
+    if grid_size <= 0.0:
+        raise ValueError("grid_size must be positive, got {}".format(grid_size))
 
     grid_id_list = []
     test_max_grid = 0
@@ -29,7 +33,7 @@ def _equal_grid(one_dim_list):
     print(test_max_grid, max_grid_id)
     return grid_id_list, max_grid_id, min_value, max_value
 
-def split_traj_into_equal_grid(traj_list):
+def split_traj_into_equal_grid(traj_list, grid_size=None):
     lon_list = []
     lat_list = []
     for traj in traj_list:
@@ -41,8 +45,8 @@ def split_traj_into_equal_grid(traj_list):
         lon_list.append(tem_lon)
         lat_list.append(tem_lat)
     
-    lon_grid_id_list, lon_max_grid_id, lon_min_value, lon_max_value = _equal_grid(lon_list)
-    lat_grid_id_list, lat_max_grid_id, lat_min_value, lat_max_value = _equal_grid(lat_list)
+    lon_grid_id_list, lon_max_grid_id, lon_min_value, lon_max_value = _equal_grid(lon_list, grid_size=grid_size)
+    lat_grid_id_list, lat_max_grid_id, lat_min_value, lat_max_value = _equal_grid(lat_list, grid_size=grid_size)
 
     lon_list = []
     lat_list = []
