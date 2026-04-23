@@ -121,6 +121,8 @@ def initialize_model(my_dict, max_traj_length):
     image_mode     = my_dict.get("image_mode", "binary")
     pdt_m          = my_dict.get("pdt_m", 16)
     pdt_k          = my_dict.get("pdt_k", 256)
+    pdt_steps      = my_dict.get("pdt_steps", 1)
+    pdt_heads      = my_dict.get("pdt_heads", 1)
     pdt_vq_type    = my_dict.get("pdt_vq_type", "dpq")
     pdt_codebook_init = my_dict.get("pdt_codebook_init", "uniform")
     qinco_h        = my_dict.get("qinco_h", 256)
@@ -134,6 +136,7 @@ def initialize_model(my_dict, max_traj_length):
     pre_quant_lambda_decor = my_dict.get("pre_quant_lambda_decor", 0.01)
     pre_quant_lambda_stab = my_dict.get("pre_quant_lambda_stab", 0.1)
     pre_quant_residual_alpha_init = my_dict.get("pre_quant_residual_alpha_init", 0.15)
+    pre_quant_learnable_alpha = my_dict.get("pre_quant_learnable_alpha", True)
     embedding_backbone = my_dict.get("embedding_backbone", "msr")
     backbone_seq_max_length = my_dict.get("backbone_seq_max_length", 200)
     simformer_num_layers = my_dict.get("simformer_num_layers", 1)
@@ -148,10 +151,10 @@ def initialize_model(my_dict, max_traj_length):
         raise ValueError("Unsupported embedding_backbone: {}".format(embedding_backbone))
 
     if my_dict["network_type"] == "TJCNN":
-        my_net = ConvTraj(lon_input_size, lat_input_size, target_size, batch_size, sampling_num, max_traj_length, channel, device, head_num, pdt_m=pdt_m, pdt_k=pdt_k, pdt_vq_type=pdt_vq_type, pdt_codebook_init=pdt_codebook_init, qinco_h=qinco_h, qinco_L=qinco_L, qinco_identity_init=qinco_identity_init, pre_quant_bottleneck_enabled=pre_quant_bottleneck_enabled, pre_quant_global_dim=pre_quant_global_dim, pre_quant_local_dim=pre_quant_local_dim, pre_quant_progress_dim=pre_quant_progress_dim, pre_quant_use_motion_stats=pre_quant_use_motion_stats, pre_quant_lambda_decor=pre_quant_lambda_decor, pre_quant_lambda_stab=pre_quant_lambda_stab, pre_quant_residual_alpha_init=pre_quant_residual_alpha_init)
+        my_net = ConvTraj(lon_input_size, lat_input_size, target_size, batch_size, sampling_num, max_traj_length, channel, device, head_num, pdt_m=pdt_m, pdt_k=pdt_k, pdt_steps=pdt_steps, pdt_heads=pdt_heads, pdt_vq_type=pdt_vq_type, pdt_codebook_init=pdt_codebook_init, qinco_h=qinco_h, qinco_L=qinco_L, qinco_identity_init=qinco_identity_init, pre_quant_bottleneck_enabled=pre_quant_bottleneck_enabled, pre_quant_global_dim=pre_quant_global_dim, pre_quant_local_dim=pre_quant_local_dim, pre_quant_progress_dim=pre_quant_progress_dim, pre_quant_use_motion_stats=pre_quant_use_motion_stats, pre_quant_lambda_decor=pre_quant_lambda_decor, pre_quant_lambda_stab=pre_quant_lambda_stab, pre_quant_residual_alpha_init=pre_quant_residual_alpha_init, pre_quant_learnable_alpha=pre_quant_learnable_alpha)
     elif my_dict["network_type"] == "TJCNN_MC_MSR":
-        if image_mode not in ["motion6", "motion6_pyr2", "multigrid3"]:
-            raise ValueError("TJCNN_MC_MSR must use image_mode='motion6', 'motion6_pyr2', or 'multigrid3'.")
+        if image_mode not in ["motion6", "dtw8", "motion6_pyr2", "multigrid3", "shape5", "shape5_pyr2", "haus6", "dfd7"]:
+            raise ValueError("TJCNN_MC_MSR must use image_mode='motion6', 'dtw8', 'motion6_pyr2', 'multigrid3', 'shape5', 'shape5_pyr2', 'haus6', or 'dfd7'.")
         if embedding_backbone == "msr":
             my_net = ResidualMultiScaleMotionCanvasCNN(lon_input_size,
                                                        lat_input_size,
@@ -165,6 +168,8 @@ def initialize_model(my_dict, max_traj_length):
                                                        image_channels=pre_rep.get_image_mode_channels(image_mode),
                                                        pdt_m=pdt_m,
                                                        pdt_k=pdt_k,
+                                                       pdt_steps=pdt_steps,
+                                                       pdt_heads=pdt_heads,
                                                        pdt_vq_type=pdt_vq_type,
                                                        pdt_codebook_init=pdt_codebook_init,
                                                        qinco_h=qinco_h,
@@ -177,7 +182,8 @@ def initialize_model(my_dict, max_traj_length):
                                                        pre_quant_use_motion_stats=pre_quant_use_motion_stats,
                                                        pre_quant_lambda_decor=pre_quant_lambda_decor,
                                                        pre_quant_lambda_stab=pre_quant_lambda_stab,
-                                                       pre_quant_residual_alpha_init=pre_quant_residual_alpha_init)
+                                                       pre_quant_residual_alpha_init=pre_quant_residual_alpha_init,
+                                                       pre_quant_learnable_alpha=pre_quant_learnable_alpha)
         else:
             my_net = ExternalSequenceBackbonePDTModel(
                 backbone_kind=embedding_backbone,
@@ -188,6 +194,8 @@ def initialize_model(my_dict, max_traj_length):
                 device=device,
                 pdt_m=pdt_m,
                 pdt_k=pdt_k,
+                pdt_steps=pdt_steps,
+                pdt_heads=pdt_heads,
                 pdt_vq_type=pdt_vq_type,
                 pdt_codebook_init=pdt_codebook_init,
                 qinco_h=qinco_h,
@@ -209,6 +217,7 @@ def initialize_model(my_dict, max_traj_length):
                 pre_quant_lambda_decor=pre_quant_lambda_decor,
                 pre_quant_lambda_stab=pre_quant_lambda_stab,
                 pre_quant_residual_alpha_init=pre_quant_residual_alpha_init,
+                pre_quant_learnable_alpha=pre_quant_learnable_alpha,
             )
     elif my_dict["network_type"] == "SimpleCNN" and ("Test_porto" in my_dict["root_read_path"]):
         my_net = SimpleCNN(lon_input_size, lat_input_size, target_size, batch_size, sampling_num, max_traj_length, channel, device, head_num)

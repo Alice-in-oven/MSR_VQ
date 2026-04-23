@@ -18,10 +18,12 @@ from PDT_VQ.train import get_args
 from mynn.model import PreQuantTrajectoryBottleneck, compute_bottleneck_regularizers
 
 
-def build_default_pdt_args(pdt_m=16, pdt_k=256, pdt_vq_type="dpq", pdt_codebook_init="uniform", qinco_h=256, qinco_L=1, qinco_identity_init=False):
+def build_default_pdt_args(pdt_m=16, pdt_k=256, pdt_steps=1, pdt_heads=1, pdt_vq_type="dpq", pdt_codebook_init="uniform", qinco_h=256, qinco_L=1, qinco_identity_init=False):
     args = get_args([])
     args.M = int(pdt_m)
     args.K = int(pdt_k)
+    args.steps = int(pdt_steps)
+    args.heads = int(pdt_heads)
     args.vq_type = str(pdt_vq_type)
     args.codebook_init = str(pdt_codebook_init)
     args.qinco_h = int(qinco_h)
@@ -288,6 +290,8 @@ class ExternalSequenceBackbonePDTModel(nn.Module):
                  device,
                  pdt_m=16,
                  pdt_k=256,
+                 pdt_steps=1,
+                 pdt_heads=1,
                  pdt_vq_type="dpq",
                  pdt_codebook_init="uniform",
                  qinco_h=256,
@@ -308,7 +312,8 @@ class ExternalSequenceBackbonePDTModel(nn.Module):
                  pre_quant_use_motion_stats=False,
                  pre_quant_lambda_decor=0.01,
                  pre_quant_lambda_stab=0.1,
-                 pre_quant_residual_alpha_init=0.15):
+                 pre_quant_residual_alpha_init=0.15,
+                 pre_quant_learnable_alpha=True):
         super().__init__()
         self.backbone_kind = str(backbone_kind)
         self.lon_input_size = int(lon_input_size)
@@ -321,6 +326,7 @@ class ExternalSequenceBackbonePDTModel(nn.Module):
         self.pre_quant_lambda_decor = float(pre_quant_lambda_decor)
         self.pre_quant_lambda_stab = float(pre_quant_lambda_stab)
         self.pre_quant_residual_alpha_init = float(pre_quant_residual_alpha_init)
+        self.pre_quant_learnable_alpha = bool(pre_quant_learnable_alpha)
         self.pre_quant_bottleneck = None
         self.smoke_grad_prefixes = ["backbone.", "PDT_model."]
         self.backbone_seq_max_length = max(8, int(backbone_seq_max_length))
@@ -350,6 +356,8 @@ class ExternalSequenceBackbonePDTModel(nn.Module):
         self.pdt_args = build_default_pdt_args(
             pdt_m=pdt_m,
             pdt_k=pdt_k,
+            pdt_steps=pdt_steps,
+            pdt_heads=pdt_heads,
             pdt_vq_type=pdt_vq_type,
             pdt_codebook_init=pdt_codebook_init,
             qinco_h=qinco_h,
@@ -368,6 +376,7 @@ class ExternalSequenceBackbonePDTModel(nn.Module):
                 use_motion_stats=self.pre_quant_use_motion_stats,
                 motion_stats_dim=6,
                 residual_alpha_init=self.pre_quant_residual_alpha_init,
+                learnable_alpha=self.pre_quant_learnable_alpha,
             )
         with torch.no_grad():
             self.PDT_model.init_transform(self.pdt_args.resume)

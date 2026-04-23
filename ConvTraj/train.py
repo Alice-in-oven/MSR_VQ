@@ -111,7 +111,8 @@ def get_args():
     parser.add_argument("--artifact_prefix",                type=str,   default="", help="standard artifact prefix for checkpoints, metrics, embeddings, and reports")
     parser.add_argument("--dist_type",                      type=str,   default="dtw", help="distance type")
     parser.add_argument("--grid_size",                      type=float, default=0.0, help="optional override for equal-grid meshing size; <=0 keeps dataset default")
-    parser.add_argument("--image_mode",                     type=str,   default="binary", choices=["binary", "motion6", "motion6_pyr2", "multigrid3"], help="2D trajectory image mode")
+    parser.add_argument("--image_mode",                     type=str,   default="binary", choices=["binary", "motion6", "dtw8", "motion6_pyr2", "multigrid3", "shape5", "shape5_pyr2", "haus6", "dfd7"], help="2D trajectory image mode")
+    parser.add_argument("--disable_specific_image_disk_cache", action="store_true", help="disable on-disk caching for specific image modes such as dtw8/dfd7/haus6")
     parser.add_argument("--embedding_backbone",             type=str,   default="msr", choices=["msr", "neutraj", "simformer"], help="continuous embedding backbone before PDT-VQ")
     parser.add_argument("--backbone_seq_max_length",        type=int,   default=200, help="maximum per-trajectory sequence length fed into non-MSR backbones via uniform downsampling")
     parser.add_argument("--simformer_num_layers",           type=int,   default=1, help="number of SIMformer encoder layers")
@@ -123,6 +124,8 @@ def get_args():
     parser.add_argument("--neutraj_use_standard_gru",       action="store_true", help="replace the NeuTraj SAM-GRU cell with a plain GRU cell")
     parser.add_argument("--pdt_m",                          type=int,   default=16, help="PDT-VQ codebook count M")
     parser.add_argument("--pdt_k",                          type=int,   default=2**8, help="PDT-VQ codebook size K")
+    parser.add_argument("--pdt_steps",                      type=int,   default=1, help="PDT transform step count")
+    parser.add_argument("--pdt_heads",                      type=int,   default=1, help="PDT transform head count")
     parser.add_argument("--pdt_vq_type",                   type=str,   default="dpq", choices=["dpq", "drq", "qinco"], help="PDT-VQ quantizer type")
     parser.add_argument("--pdt_codebook_init",             type=str,   default="uniform", choices=["uniform", "faiss"], help="PDT-VQ codebook initialization strategy")
     parser.add_argument("--qinco_h",                       type=int,   default=256, help="hidden width for QINCo residual blocks")
@@ -159,6 +162,7 @@ def get_args():
     parser.add_argument("--pre_quant_lambda_decor",        type=float, default=0.01, help="decorrelation regularizer weight for the bottleneck")
     parser.add_argument("--pre_quant_lambda_stab",         type=float, default=0.1, help="stabilization regularizer weight for the bottleneck")
     parser.add_argument("--pre_quant_residual_alpha_init", type=float, default=0.15, help="initial residual mixing strength for the bottleneck")
+    parser.add_argument("--disable_pre_quant_learnable_alpha", action="store_true", help="disable learnable pre-quant residual alpha and fall back to direct residual addition")
     parser.add_argument("--pre_quant_lr_multiplier",       type=float, default=0.25, help="learning-rate multiplier for bottleneck parameters")
     parser.add_argument("--pre_quant_stab_late_epoch",     type=int,   default=100, help="epoch to strengthen bottleneck stabilization")
     parser.add_argument("--pre_quant_stab_late_multiplier",type=float, default=4.0, help="multiplier for bottleneck stabilization after the late epoch")
@@ -228,8 +232,8 @@ def get_args():
     args = parser.parse_args()
     if args.network_type == "TJCNN" and args.image_mode != "binary":
         raise ValueError("TJCNN must use --image_mode binary to preserve the original baseline.")
-    if args.network_type == "TJCNN_MC_MSR" and args.image_mode not in ["motion6", "motion6_pyr2", "multigrid3"]:
-        raise ValueError("TJCNN_MC_MSR must use --image_mode motion6, motion6_pyr2, or multigrid3.")
+    if args.network_type == "TJCNN_MC_MSR" and args.image_mode not in ["motion6", "dtw8", "motion6_pyr2", "multigrid3", "shape5", "shape5_pyr2", "haus6", "dfd7"]:
+        raise ValueError("TJCNN_MC_MSR must use --image_mode motion6, dtw8, motion6_pyr2, multigrid3, shape5, shape5_pyr2, haus6, or dfd7.")
     if args.embedding_backbone != "msr" and args.network_type != "TJCNN_MC_MSR":
         raise ValueError("Non-MSR embedding_backbone currently only supports network_type='TJCNN_MC_MSR'.")
 
@@ -352,6 +356,7 @@ if __name__ == "__main__":
                             artifact_prefix                = artifact_prefix,
                             grid_size                      = args.grid_size,
                             image_mode                     = args.image_mode,
+                            specific_image_disk_cache_enabled = not args.disable_specific_image_disk_cache,
                             embedding_backbone             = args.embedding_backbone,
                             backbone_seq_max_length        = args.backbone_seq_max_length,
                             simformer_num_layers           = args.simformer_num_layers,
@@ -363,6 +368,8 @@ if __name__ == "__main__":
                             neutraj_use_standard_gru       = args.neutraj_use_standard_gru,
                             pdt_m                          = args.pdt_m,
                             pdt_k                          = args.pdt_k,
+                            pdt_steps                      = args.pdt_steps,
+                            pdt_heads                      = args.pdt_heads,
                             pdt_vq_type                    = args.pdt_vq_type,
                             pdt_codebook_init              = args.pdt_codebook_init,
                             qinco_h                        = args.qinco_h,
@@ -399,6 +406,7 @@ if __name__ == "__main__":
                             pre_quant_lambda_decor         = args.pre_quant_lambda_decor,
                             pre_quant_lambda_stab          = args.pre_quant_lambda_stab,
                             pre_quant_residual_alpha_init  = args.pre_quant_residual_alpha_init,
+                            pre_quant_learnable_alpha      = not args.disable_pre_quant_learnable_alpha,
                             pre_quant_lr_multiplier        = args.pre_quant_lr_multiplier,
                             pre_quant_stab_late_epoch      = args.pre_quant_stab_late_epoch,
                             pre_quant_stab_late_multiplier = args.pre_quant_stab_late_multiplier,
@@ -528,6 +536,3 @@ if __name__ == "__main__":
         traj_network.train()
     else:
         raise ValueError("Train Mode Value Error!")
-
-
-

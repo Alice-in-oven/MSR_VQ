@@ -48,6 +48,7 @@ class ConfigClass():
                  artifact_prefix                = "",
                  grid_size                      = 0.0,
                  image_mode                     = "binary",
+                 specific_image_disk_cache_enabled = True,
                  embedding_backbone             = "msr",
                  backbone_seq_max_length        = 200,
                  simformer_num_layers           = 1,
@@ -59,6 +60,8 @@ class ConfigClass():
                  neutraj_use_standard_gru       = False,
                  pdt_m                          = 16,
                  pdt_k                          = 256,
+                 pdt_steps                      = 1,
+                 pdt_heads                      = 1,
                  pdt_vq_type                    = "dpq",
                  pdt_codebook_init              = "uniform",
                  qinco_h                        = 256,
@@ -95,6 +98,7 @@ class ConfigClass():
                  pre_quant_lambda_decor         = 0.01,
                  pre_quant_lambda_stab          = 0.1,
                  pre_quant_residual_alpha_init  = 0.15,
+                 pre_quant_learnable_alpha      = True,
                  pre_quant_lr_multiplier        = 0.25,
                  pre_quant_stab_late_epoch      = 100,
                  pre_quant_stab_late_multiplier = 4.0,
@@ -198,6 +202,7 @@ class ConfigClass():
         self.my_dict["artifact_prefix"]                = artifact_prefix
         self.my_dict["grid_size"]                      = grid_size
         self.my_dict["image_mode"]                     = image_mode
+        self.my_dict["specific_image_disk_cache_enabled"] = specific_image_disk_cache_enabled
         self.my_dict["embedding_backbone"]             = embedding_backbone
         self.my_dict["backbone_seq_max_length"]        = backbone_seq_max_length
         self.my_dict["simformer_num_layers"]           = simformer_num_layers
@@ -209,6 +214,8 @@ class ConfigClass():
         self.my_dict["neutraj_use_standard_gru"]       = neutraj_use_standard_gru
         self.my_dict["pdt_m"]                          = pdt_m
         self.my_dict["pdt_k"]                          = pdt_k
+        self.my_dict["pdt_steps"]                      = pdt_steps
+        self.my_dict["pdt_heads"]                      = pdt_heads
         self.my_dict["pdt_vq_type"]                    = pdt_vq_type
         self.my_dict["pdt_codebook_init"]              = pdt_codebook_init
         self.my_dict["qinco_h"]                        = qinco_h
@@ -245,6 +252,7 @@ class ConfigClass():
         self.my_dict["pre_quant_lambda_decor"]         = pre_quant_lambda_decor
         self.my_dict["pre_quant_lambda_stab"]          = pre_quant_lambda_stab
         self.my_dict["pre_quant_residual_alpha_init"]  = pre_quant_residual_alpha_init
+        self.my_dict["pre_quant_learnable_alpha"]      = pre_quant_learnable_alpha
         self.my_dict["pre_quant_lr_multiplier"]        = pre_quant_lr_multiplier
         self.my_dict["pre_quant_stab_late_epoch"]      = pre_quant_stab_late_epoch
         self.my_dict["pre_quant_stab_late_multiplier"] = pre_quant_stab_late_multiplier

@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import pickle
 import time
@@ -54,6 +55,55 @@ def clone_feature_list(feature_list):
     return [[point[:] for point in traj] for traj in feature_list]
 
 
+def shared_specific_image_cache_root(config_dict):
+    if not bool(config_dict.get("specific_image_disk_cache_enabled", True)):
+        return None
+    cache_root = Path(str(config_dict.get("root_read_path", ""))) / "_specific_image_cache"
+    cache_root.mkdir(parents = True, exist_ok = True)
+    return cache_root
+
+
+def shared_specific_image_array_cache_dir(config_dict):
+    cache_root = shared_specific_image_cache_root(config_dict)
+    if cache_root is None:
+        return None
+    cache_dir = cache_root / "arrays" / str(config_dict.get("image_mode", "binary"))
+    cache_dir.mkdir(parents = True, exist_ok = True)
+    return str(cache_dir)
+
+
+def shared_haus6_dt_cache_dir(config_dict):
+    if str(config_dict.get("image_mode", "")) != "haus6":
+        return None
+    cache_root = shared_specific_image_cache_root(config_dict)
+    if cache_root is None:
+        return None
+    cache_dir = cache_root / "haus6_dt"
+    cache_dir.mkdir(parents = True, exist_ok = True)
+    return str(cache_dir)
+
+
+def shared_specific_image_cache_shard_size(config_dict):
+    shard_size = int(config_dict.get("specific_image_cache_shard_size", 2048))
+    return max(1, shard_size)
+
+
+def shared_specific_image_batch_cache_key(split_tag, split_size, shard_begin, shard_end, state):
+    digest = json.dumps({
+        "version": "specific_image_cache_v2",
+        "dataset": state["config_dict"].get("dataset", ""),
+        "root_read_path": state["config_dict"].get("root_read_path", ""),
+        "image_mode": state["config_dict"].get("image_mode", ""),
+        "lon_input_size": state["lon_input_size"],
+        "lat_input_size": state["lat_input_size"],
+        "split_tag": split_tag,
+        "split_size": int(split_size),
+        "shard_begin": int(shard_begin),
+        "shard_end": int(shard_end),
+    }, sort_keys = True)
+    return hashlib.sha1(digest.encode("utf-8")).hexdigest()
+
+
 def load_model_and_data(args):
     config_path = resolve_config_path(args.checkpoint_path, args.config_path)
     with open(config_path, "r", encoding = "utf-8") as f:
@@ -98,15 +148,44 @@ def load_model_and_data(args):
     }
 
 
-def build_batch_tensors(batch_indices, state):
+def build_batch_tensors(split_indices, begin, end, state, split_tag):
+    batch_indices = split_indices[begin:end]
     lon_batch = clone_feature_list([state["lon_list"][index] for index in batch_indices])
     lat_batch = clone_feature_list([state["lat_list"][index] for index in batch_indices])
-    image_batch = pre_rep.build_traj_image([state["lon_grid_id_list"][index] for index in batch_indices],
-                                           [state["lat_grid_id_list"][index] for index in batch_indices],
-                                           state["lon_input_size"],
-                                           state["lat_input_size"],
-                                           image_mode = state["config_dict"].get("image_mode", "binary"),
-                                           traj_list = [state["traj_list"][index] for index in batch_indices])
+    image_mode = state["config_dict"].get("image_mode", "binary")
+    disk_cache_enabled = bool(state["config_dict"].get("specific_image_disk_cache_enabled", True))
+    if pre_rep.is_disk_cached_image_mode(image_mode, disk_cache_enabled=disk_cache_enabled):
+        shard_size = shared_specific_image_cache_shard_size(state["config_dict"])
+        split_size = len(split_indices)
+        image_parts = []
+        relative_cursor = begin
+        while relative_cursor < end:
+            shard_begin = (relative_cursor // shard_size) * shard_size
+            shard_end = min(shard_begin + shard_size, split_size)
+            shard_indices = split_indices[shard_begin:shard_end]
+            shard_images = pre_rep.build_traj_image(
+                [state["lon_grid_id_list"][index] for index in shard_indices],
+                [state["lat_grid_id_list"][index] for index in shard_indices],
+                state["lon_input_size"],
+                state["lat_input_size"],
+                image_mode=image_mode,
+                traj_list=[state["traj_list"][index] for index in shard_indices],
+                cache_dir=shared_specific_image_array_cache_dir(state["config_dict"]),
+                cache_key=shared_specific_image_batch_cache_key(split_tag, split_size, shard_begin, shard_end, state),
+                haus6_dt_cache_dir=shared_haus6_dt_cache_dir(state["config_dict"]),
+            )
+            take_begin = relative_cursor - shard_begin
+            take_end = min(end, shard_end) - shard_begin
+            image_parts.append(np.asarray(shard_images[take_begin:take_end], dtype=np.float32))
+            relative_cursor = min(end, shard_end)
+        image_batch = np.concatenate(image_parts, axis=0)
+    else:
+        image_batch = pre_rep.build_traj_image([state["lon_grid_id_list"][index] for index in batch_indices],
+                                               [state["lat_grid_id_list"][index] for index in batch_indices],
+                                               state["lon_input_size"],
+                                               state["lat_input_size"],
+                                               image_mode = image_mode,
+                                               traj_list = [state["traj_list"][index] for index in batch_indices])
     lon_tensor = torch.tensor(function.pad_traj_list(lon_batch, state["max_traj_length"], pad_value = 0.0),
                               dtype = torch.float32,
                               device = state["config_dict"]["device"])
@@ -117,13 +196,12 @@ def build_batch_tensors(batch_indices, state):
     return lon_tensor, lat_tensor, image_tensor
 
 
-def encode_continuous_split(split_indices, state, batch_size):
+def encode_continuous_split(split_indices, state, batch_size, split_tag):
     outputs = []
     with torch.no_grad():
         for begin in range(0, len(split_indices), batch_size):
             end = min(begin + batch_size, len(split_indices))
-            batch_indices = split_indices[begin:end]
-            lon_tensor, lat_tensor, image_tensor = build_batch_tensors(batch_indices, state)
+            lon_tensor, lat_tensor, image_tensor = build_batch_tensors(split_indices, begin, end, state, split_tag)
             embedding = state["model"].inference_continuous(lon_tensor, lat_tensor, image_tensor)
             outputs.append(embedding.detach().cpu().numpy().astype(np.float32))
     return np.concatenate(outputs, axis = 0)
@@ -194,8 +272,8 @@ def load_or_build_continuous_cache(state, args):
     print("Continuous embedding cache: MISS, encoding query/base continuous embeddings...")
     query_indices = np.arange(state["train_set"], state["train_set"] + state["query_set"], dtype = np.int32)
     base_indices = np.arange(state["train_set"] + state["query_set"], state["train_set"] + state["query_set"] + state["base_set"], dtype = np.int32)
-    query_continuous = encode_continuous_split(query_indices, state, args.batch_size)
-    base_continuous = encode_continuous_split(base_indices, state, args.batch_size)
+    query_continuous = encode_continuous_split(query_indices, state, args.batch_size, "query")
+    base_continuous = encode_continuous_split(base_indices, state, args.batch_size, "base")
     np.savez(cache_npz,
              query_continuous = query_continuous,
              base_continuous = base_continuous)

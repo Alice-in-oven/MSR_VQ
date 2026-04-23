@@ -4,6 +4,13 @@ import torch.nn.functional as F
 from tools import feature_distance
 
 
+def _safe_logit(value, eps=1e-4):
+    value = float(value)
+    value = min(max(value, eps), 1.0 - eps)
+    tensor_value = torch.tensor(value, dtype=torch.float32)
+    return torch.logit(tensor_value).item()
+
+
 def summarize_motion_canvas_stats(motion_canvas):
     if motion_canvas is None or motion_canvas.dim() != 4 or motion_canvas.shape[1] < 6:
         return None
@@ -59,7 +66,8 @@ class PreQuantTrajectoryBottleneck(nn.Module):
                  progress_dim=32,
                  use_motion_stats=False,
                  motion_stats_dim=6,
-                 residual_alpha_init=0.15):
+                 residual_alpha_init=0.15,
+                 learnable_alpha=True):
         super().__init__()
         total_dim = int(global_dim) + int(local_dim) + int(progress_dim)
         if total_dim != int(cont_dim):
@@ -74,6 +82,11 @@ class PreQuantTrajectoryBottleneck(nn.Module):
         self.use_motion_stats = bool(use_motion_stats)
         self.motion_stats_dim = int(motion_stats_dim)
         self.residual_alpha_init = float(residual_alpha_init)
+        self.learnable_alpha = bool(learnable_alpha)
+        if self.learnable_alpha:
+            self.residual_alpha_logit = nn.Parameter(torch.tensor(_safe_logit(self.residual_alpha_init), dtype=torch.float32))
+        else:
+            self.register_parameter("residual_alpha_logit", None)
 
         self.global_proj = SmallProjectionHead(self.img_dim + self.cont_dim, self.global_dim)
         self.local_proj = SmallProjectionHead(self.seq_dim + self.cont_dim, self.local_dim)
@@ -102,11 +115,22 @@ class PreQuantTrajectoryBottleneck(nn.Module):
             [self.global_dim, self.local_dim, self.progress_dim],
             dim=1,
         )
-        structured_feature = torch.cat((
-            base_global + u_global,
-            base_local + u_local,
-            base_progress + u_progress,
-        ), dim=1)
+        if self.learnable_alpha:
+            residual_alpha = torch.sigmoid(self.residual_alpha_logit)
+            structured_feature = torch.cat((
+                base_global + residual_alpha * u_global,
+                base_local + residual_alpha * u_local,
+                base_progress + residual_alpha * u_progress,
+            ), dim=1)
+            residual_alpha_value = float(residual_alpha.detach().cpu())
+        else:
+            residual_alpha = e_cont.new_tensor(self.residual_alpha_init)
+            structured_feature = torch.cat((
+                base_global + residual_alpha * u_global,
+                base_local + residual_alpha * u_local,
+                base_progress + residual_alpha * u_progress,
+            ), dim=1)
+            residual_alpha_value = float(residual_alpha.detach().cpu())
         structured_feature = self.structured_norm(structured_feature)
         e_bottleneck = self.output_norm(structured_feature)
 
@@ -124,7 +148,8 @@ class PreQuantTrajectoryBottleneck(nn.Module):
             "structured_feature_std": float(structured_feature.std(unbiased=False).detach().cpu()),
             "e_bottleneck_mean": float(e_bottleneck.mean().detach().cpu()),
             "e_bottleneck_std": float(e_bottleneck.std(unbiased=False).detach().cpu()),
-            "residual_alpha": 1.0,
+            "residual_alpha": residual_alpha_value,
+            "learnable_alpha": self.learnable_alpha,
         }
         return {
             "u_global": u_global,

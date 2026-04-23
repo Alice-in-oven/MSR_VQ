@@ -284,6 +284,148 @@ class NeuTrajTrainer(object):
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir / "chunk_{}_{}.npz".format(begin_pos, end_pos)
 
+    def _shared_specific_image_cache_root(self):
+        if not bool(self.my_config.my_dict.get("specific_image_disk_cache_enabled", True)):
+            return None
+        root_read_path = str(self.my_config.my_dict.get("root_read_path", "")).strip()
+        if not root_read_path:
+            return None
+        cache_root = Path(root_read_path) / "_specific_image_cache"
+        cache_root.mkdir(parents=True, exist_ok=True)
+        return cache_root
+
+    def _shared_specific_image_array_cache_dir(self):
+        cache_root = self._shared_specific_image_cache_root()
+        if cache_root is None:
+            return None
+        cache_dir = cache_root / "arrays" / str(self.my_config.my_dict.get("image_mode", "binary"))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return str(cache_dir)
+
+    def _shared_haus6_dt_cache_dir(self):
+        if str(self.my_config.my_dict.get("image_mode", "")) != "haus6":
+            return None
+        cache_root = self._shared_specific_image_cache_root()
+        if cache_root is None:
+            return None
+        cache_dir = cache_root / "haus6_dt"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return str(cache_dir)
+
+    def _shared_specific_image_cache_shard_size(self):
+        shard_size = int(self.my_config.my_dict.get("specific_image_cache_shard_size", 2048))
+        return max(1, shard_size)
+
+    def _shared_specific_image_split_specs(self):
+        total_num = len(self.traj_list)
+        cursor = 0
+        split_specs = []
+        for split_tag, split_size in [
+            ("train", int(self.my_config.my_dict.get("train_set", 0))),
+            ("query", int(self.my_config.my_dict.get("query_set", 0))),
+            ("base", int(self.my_config.my_dict.get("base_set", 0))),
+        ]:
+            if cursor >= total_num:
+                break
+            split_end = min(cursor + max(0, split_size), total_num)
+            if split_end > cursor:
+                split_specs.append((split_tag, cursor, split_end))
+            cursor = split_end
+        if cursor < total_num:
+            split_specs.append(("extra", cursor, total_num))
+        return split_specs
+
+    def _iter_shared_specific_image_split_segments(self, begin_pos, end_pos):
+        for split_tag, split_begin, split_end in self._shared_specific_image_split_specs():
+            seg_begin = max(begin_pos, split_begin)
+            seg_end = min(end_pos, split_end)
+            if seg_begin >= seg_end:
+                continue
+            yield {
+                "split_tag": split_tag,
+                "split_begin": split_begin,
+                "split_end": split_end,
+                "segment_begin": seg_begin,
+                "segment_end": seg_end,
+            }
+
+    def _shared_specific_image_cache_key(self, split_tag, split_size, shard_begin, shard_end):
+        cache_signature = "|".join([
+            "specific_image_cache_v2",
+            str(self.my_config.my_dict.get("dataset", "")),
+            str(self.my_config.my_dict.get("root_read_path", "")),
+            str(self.my_config.my_dict.get("image_mode", "")),
+            str(self.my_config.my_dict.get("lon_input_size", "")),
+            str(self.my_config.my_dict.get("lat_input_size", "")),
+            str(split_tag),
+            str(split_size),
+            str(shard_begin),
+            str(shard_end),
+        ])
+        return hashlib.sha1(cache_signature.encode("utf-8")).hexdigest()
+
+    def _build_shared_specific_image_range(self, begin_pos, end_pos):
+        image_mode = str(self.my_config.my_dict.get("image_mode", "binary"))
+        disk_cache_enabled = bool(self.my_config.my_dict.get("specific_image_disk_cache_enabled", True))
+        if not pre_rep.is_disk_cached_image_mode(image_mode, disk_cache_enabled=disk_cache_enabled):
+            return pre_rep.build_traj_image(
+                self.lon_grid_id_list[begin_pos:end_pos],
+                self.lat_grid_id_list[begin_pos:end_pos],
+                self.my_config.my_dict["lon_input_size"],
+                self.my_config.my_dict["lat_input_size"],
+                image_mode=image_mode,
+                traj_list=self.traj_list[begin_pos:end_pos],
+            )
+
+        shard_size = self._shared_specific_image_cache_shard_size()
+        cache_dir = self._shared_specific_image_array_cache_dir()
+        haus6_dt_cache_dir = self._shared_haus6_dt_cache_dir()
+        image_parts = []
+
+        for segment in self._iter_shared_specific_image_split_segments(begin_pos, end_pos):
+            split_tag = segment["split_tag"]
+            split_begin = segment["split_begin"]
+            split_end = segment["split_end"]
+            split_size = split_end - split_begin
+            segment_begin = segment["segment_begin"]
+            segment_end = segment["segment_end"]
+
+            relative_cursor = segment_begin - split_begin
+            relative_end = segment_end - split_begin
+            while relative_cursor < relative_end:
+                shard_begin = (relative_cursor // shard_size) * shard_size
+                shard_end = min(shard_begin + shard_size, split_size)
+                global_shard_begin = split_begin + shard_begin
+                global_shard_end = split_begin + shard_end
+                shard_images = pre_rep.build_traj_image(
+                    self.lon_grid_id_list[global_shard_begin:global_shard_end],
+                    self.lat_grid_id_list[global_shard_begin:global_shard_end],
+                    self.my_config.my_dict["lon_input_size"],
+                    self.my_config.my_dict["lat_input_size"],
+                    image_mode=image_mode,
+                    traj_list=self.traj_list[global_shard_begin:global_shard_end],
+                    cache_dir=cache_dir,
+                    cache_key=self._shared_specific_image_cache_key(
+                        split_tag,
+                        split_size,
+                        shard_begin,
+                        shard_end,
+                    ),
+                    haus6_dt_cache_dir=haus6_dt_cache_dir,
+                )
+                take_begin = relative_cursor - shard_begin
+                take_end = min(relative_end, shard_end) - shard_begin
+                image_parts.append(np.asarray(shard_images[take_begin:take_end], dtype=np.float32))
+                relative_cursor = min(relative_end, shard_end)
+
+        if image_parts:
+            return np.concatenate(image_parts, axis=0)
+        channel_num = pre_rep.get_image_mode_channels(image_mode)
+        return np.zeros(
+            (0, channel_num, self.my_config.my_dict["lon_input_size"], self.my_config.my_dict["lat_input_size"]),
+            dtype=np.float32,
+        )
+
     def _load_eval_preproc_cache(self, begin_pos, end_pos):
         cache_path = self._eval_preproc_cache_path(begin_pos, end_pos)
         if not cache_path.exists():
@@ -527,14 +669,7 @@ class NeuTrajTrainer(object):
         pad_total_lon_grid = self._pad_eval_sequence_array(lon_grid_seq, self.max_traj_length)
         pad_total_lat_grid = self._pad_eval_sequence_array(lat_grid_seq, self.max_traj_length)
         if self.my_config.my_dict.get("embedding_backbone", "msr") == "msr":
-            pad_total_lon_lat_image = pre_rep.build_traj_image(
-                self.lon_grid_id_list[begin_pos:end_pos],
-                self.lat_grid_id_list[begin_pos:end_pos],
-                self.my_config.my_dict["lon_input_size"],
-                self.my_config.my_dict["lat_input_size"],
-                image_mode=self.my_config.my_dict.get("image_mode", "binary"),
-                traj_list=self.traj_list[begin_pos:end_pos],
-            )
+            pad_total_lon_lat_image = self._build_shared_specific_image_range(begin_pos, end_pos)
         else:
             pad_total_lon_lat_image = np.zeros((end_pos - begin_pos, 1, 1, 1), dtype=np.float32)
         seq_len_list = self.traj_length_list[begin_pos:end_pos]
@@ -1637,6 +1772,8 @@ class NeuTrajTrainer(object):
                 "image_mode",
                 "pdt_m",
                 "pdt_k",
+                "pdt_steps",
+                "pdt_heads",
                 "pdt_vq_type",
                 "pdt_codebook_init",
                 "qinco_h",
@@ -1650,6 +1787,7 @@ class NeuTrajTrainer(object):
                 "pre_quant_lambda_decor",
                 "pre_quant_lambda_stab",
                 "pre_quant_residual_alpha_init",
+                "pre_quant_learnable_alpha",
             ]
             for key in typed_keys:
                 if key in raw_config:
@@ -2207,12 +2345,10 @@ class NeuTrajTrainer(object):
         '''
         
         if self.my_config.my_dict.get("embedding_backbone", "msr") == "msr":
-            self.lon_lat_image = pre_rep.build_traj_image(lon_grid_id_list[:self.my_config.my_dict["train_set"]],
-                                                          lat_grid_id_list[:self.my_config.my_dict["train_set"]],
-                                                          self.my_config.my_dict["lon_input_size"],
-                                                          self.my_config.my_dict["lat_input_size"],
-                                                          image_mode=self.my_config.my_dict.get("image_mode", "binary"),
-                                                          traj_list=self.traj_list[:self.my_config.my_dict["train_set"]])
+            self.lon_lat_image = self._build_shared_specific_image_range(
+                0,
+                self.my_config.my_dict["train_set"],
+            )
         else:
             self.lon_lat_image = np.zeros((self.my_config.my_dict["train_set"], 1, 1, 1), dtype=np.float32)
         

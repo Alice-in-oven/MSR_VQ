@@ -25,10 +25,12 @@ from PDT_VQ.utils.engine import inference_vetor
 POOL = nn.MaxPool1d
 
 
-def build_default_pdt_args(pdt_m=16, pdt_k=256, pdt_vq_type="dpq", pdt_codebook_init="uniform", qinco_h=256, qinco_L=1, qinco_identity_init=False):
+def build_default_pdt_args(pdt_m=16, pdt_k=256, pdt_steps=1, pdt_heads=1, pdt_vq_type="dpq", pdt_codebook_init="uniform", qinco_h=256, qinco_L=1, qinco_identity_init=False):
     args = get_args([])
     args.M = int(pdt_m)
     args.K = int(pdt_k)
+    args.steps = int(pdt_steps)
+    args.heads = int(pdt_heads)
     args.vq_type = str(pdt_vq_type)
     args.codebook_init = str(pdt_codebook_init)
     args.qinco_h = int(qinco_h)
@@ -93,6 +95,8 @@ class ShortCutCNN(nn.Module):
                  head_num,
                  pdt_m=16,
                  pdt_k=256,
+                 pdt_steps=1,
+                 pdt_heads=1,
                  pdt_vq_type="dpq",
                  pdt_codebook_init="uniform",
                  qinco_h=256,
@@ -105,7 +109,8 @@ class ShortCutCNN(nn.Module):
                  pre_quant_use_motion_stats=False,
                  pre_quant_lambda_decor=0.01,
                  pre_quant_lambda_stab=0.1,
-                 pre_quant_residual_alpha_init=0.15):
+                 pre_quant_residual_alpha_init=0.15,
+                 pre_quant_learnable_alpha=True):
         super(ShortCutCNN, self).__init__()
         self.lon_input_size = lon_input_size
         self.lat_input_size = lat_input_size
@@ -164,6 +169,8 @@ class ShortCutCNN(nn.Module):
         self.pdt_args = build_default_pdt_args(
             pdt_m=pdt_m,
             pdt_k=pdt_k,
+            pdt_steps=pdt_steps,
+            pdt_heads=pdt_heads,
             pdt_vq_type=pdt_vq_type,
             pdt_codebook_init=pdt_codebook_init,
             qinco_h=qinco_h,
@@ -178,6 +185,7 @@ class ShortCutCNN(nn.Module):
         self.pre_quant_lambda_decor = float(pre_quant_lambda_decor)
         self.pre_quant_lambda_stab = float(pre_quant_lambda_stab)
         self.pre_quant_residual_alpha_init = float(pre_quant_residual_alpha_init)
+        self.pre_quant_learnable_alpha = bool(pre_quant_learnable_alpha)
         self.pre_quant_bottleneck = None
         if self.pre_quant_bottleneck_enabled:
             self.pre_quant_bottleneck = PreQuantTrajectoryBottleneck(
@@ -190,6 +198,7 @@ class ShortCutCNN(nn.Module):
                 use_motion_stats=self.pre_quant_use_motion_stats,
                 motion_stats_dim=6,
                 residual_alpha_init=self.pre_quant_residual_alpha_init,
+                learnable_alpha=self.pre_quant_learnable_alpha,
             )
 
         with torch.no_grad():
@@ -410,6 +419,8 @@ class ResidualMultiScaleMotionCanvasCNN(ShortCutCNN):
                  image_channels=6,
                  pdt_m=16,
                  pdt_k=256,
+                 pdt_steps=1,
+                 pdt_heads=1,
                  pdt_vq_type="dpq",
                  pdt_codebook_init="uniform",
                  qinco_h=256,
@@ -422,7 +433,8 @@ class ResidualMultiScaleMotionCanvasCNN(ShortCutCNN):
                  pre_quant_use_motion_stats=False,
                  pre_quant_lambda_decor=0.01,
                  pre_quant_lambda_stab=0.1,
-                 pre_quant_residual_alpha_init=0.15):
+                 pre_quant_residual_alpha_init=0.15,
+                 pre_quant_learnable_alpha=True):
         super(ResidualMultiScaleMotionCanvasCNN, self).__init__(
             lon_input_size,
             lat_input_size,
@@ -435,6 +447,8 @@ class ResidualMultiScaleMotionCanvasCNN(ShortCutCNN):
             head_num,
             pdt_m=pdt_m,
             pdt_k=pdt_k,
+            pdt_steps=pdt_steps,
+            pdt_heads=pdt_heads,
             pdt_vq_type=pdt_vq_type,
             pdt_codebook_init=pdt_codebook_init,
             qinco_h=qinco_h,
@@ -448,6 +462,7 @@ class ResidualMultiScaleMotionCanvasCNN(ShortCutCNN):
             pre_quant_lambda_decor=pre_quant_lambda_decor,
             pre_quant_lambda_stab=pre_quant_lambda_stab,
             pre_quant_residual_alpha_init=pre_quant_residual_alpha_init,
+            pre_quant_learnable_alpha=pre_quant_learnable_alpha,
         )
         self.image_channels = image_channels
         self.conv_xy = nn.Sequential(
